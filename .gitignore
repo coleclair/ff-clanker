@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# App-generated / machine-specific (not meant to be shared)
+cache/
+draft_autosave.json
+league_settings.json
+*.lnk
+
+# OS cruft
+Thumbs.db
+.DS_Store
