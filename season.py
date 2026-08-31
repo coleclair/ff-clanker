@@ -188,6 +188,7 @@ def get_pickups(limit: int = 25, lookback_hours: int = 168, force: bool = False)
                                         info.get("last_name")) if x)
                 or pid)
         out.append({
+            "player_id": pid,
             "name": name,
             "pos": "K" if pos == "PK" else pos,
             "team": info.get("team") or "FA",
@@ -260,6 +261,317 @@ def best_streamers(games: list):
     defenses.sort(key=lambda x: x["opp_implied"])
     kickers.sort(key=lambda x: -x["implied"])
     return defenses, kickers
+
+
+# ---------------------------------------------------------------------------
+# League-aware analytics: FAAB waivers, roster, start/sit, byes, matchup
+#
+# These are PURE functions (no network) so they stay headless-testable. The GUI
+# fetches the raw Sleeper data (rosters, transactions, matchups) and the ADP
+# id-bridge, then feeds them in here.
+# ---------------------------------------------------------------------------
+import math
+
+_HURT = {"out": 3, "injured reserve": 3, "ir": 3, "pup": 3, "doubtful": 2,
+         "suspended": 2, "questionable": 1, "day-to-day": 1}
+AVG_TEAM_TOTAL = 22.0  # rough league-average implied points, for matchup deltas
+
+
+def rostered_ids(rosters: list) -> set:
+    """Every player_id owned by any team in the league (as strings)."""
+    out = set()
+    for r in rosters or []:
+        for pid in (r.get("players") or []):
+            out.add(str(pid))
+    return out
+
+
+def faab_status(league: dict, roster: dict) -> dict:
+    settings = (league or {}).get("settings") or {}
+    budget = int(settings.get("waiver_budget", 0) or 0)
+    rs = (roster or {}).get("settings") or {}
+    used = int(rs.get("waiver_budget_used", 0) or 0)
+    return {"budget": budget, "used": used, "left": max(budget - used, 0),
+            "waiver_position": rs.get("waiver_position")}
+
+
+def _bridge_player(bridge, pid):
+    return (bridge or {}).get(str(pid))
+
+
+def free_agents(pickups: list, rostered: set, need_positions=None,
+                bridge=None, limit: int = 40) -> list:
+    """Trending adds that are still FREE in *your* league, annotated.
+
+    ``pickups`` is get_pickups() output (has player_id/count). We drop anyone
+    already rostered, then enrich with bye/vorp/adp from the ADP id-bridge and
+    whether the position fills one of your roster needs.
+    """
+    need_positions = need_positions or set()
+    out = []
+    for p in pickups or []:
+        pid = str(p.get("player_id") or "")
+        if not pid or pid in rostered:
+            continue
+        eng = _bridge_player(bridge, pid)
+        pos = p.get("pos") or (eng.position if eng else "?")
+        pos = "K" if pos == "PK" else ("DEF" if pos == "DST" else pos)
+        out.append({
+            "player_id": pid,
+            "name": p.get("name"),
+            "pos": pos,
+            "team": p.get("team") or (eng.team if eng else "FA"),
+            "count": int(p.get("count", 0) or 0),
+            "injury_status": p.get("injury_status") or "",
+            "bye": (eng.bye if eng else 0) or 0,
+            "vorp": (eng.vorp if eng else None),
+            "adp": (eng.adp if eng else None),
+            "fills_need": pos in need_positions,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def suggest_bid(rank: int, faab_left: int, fills_need: bool,
+                has_value: bool = False) -> dict:
+    """A FAAB bid recommendation.
+
+    Driven by the player's rank on your waiver board (demand), whether they
+    fill a roster need, and whether they carry real redraft value (a startable
+    player who slipped to waivers deserves the biggest bid). Deliberately
+    conservative -- most pickups should be a few dollars, not a third of budget.
+    """
+    if faab_left <= 0:
+        return {"dollars": 0, "pct": 0.0, "tier": "\u2014"}
+    pct = 0.12 * (0.66 ** max(rank, 0))    # #1 ~12%, decays fast down the board
+    if fills_need:
+        pct += 0.06
+    if has_value:
+        pct += 0.12                        # an actually-startable FA is gold
+    pct = min(pct, 0.5)
+    dollars = max(1, round(faab_left * pct))
+    tier = ("Priority" if pct >= 0.22 else
+            "Solid" if pct >= 0.09 else "Speculative")
+    return {"dollars": dollars, "pct": pct, "tier": tier}
+
+
+def _hurt_rank(injury_status: str) -> int:
+    return _HURT.get((injury_status or "").lower(), 0)
+
+
+def drop_candidates(my_players: list, n: int = 6) -> list:
+    """Your most-droppable players first (injured, then lowest value)."""
+    def key(p):
+        return (-_hurt_rank(getattr(p, "injury_status", "")),
+                getattr(p, "vorp", 0.0))
+    return sorted(my_players or [], key=key)[:n]
+
+
+def team_implied_map(games: list) -> dict:
+    """{team_abbr: implied_team_total} from Vegas odds."""
+    m = {}
+    for g in games or []:
+        hi, ai = g.get("home_implied"), g.get("away_implied")
+        if hi is not None:
+            m[g["home"]["abbr"]] = hi
+        if ai is not None:
+            m[g["away"]["abbr"]] = ai
+    return m
+
+
+def _opp_map(games: list) -> dict:
+    """{team_abbr: (opp_abbr, home_or_away)} for the week."""
+    m = {}
+    for g in games or []:
+        h, a = g["home"]["abbr"], g["away"]["abbr"]
+        m[h] = (a, "vs")
+        m[a] = (h, "@")
+    return m
+
+
+def week_score(vorp, implied) -> float:
+    """Matchup-adjusted weekly score: season value + game environment.
+
+    Deliberately simple/transparent (no weekly projections exist in the free
+    feeds): talent from VORP plus a Vegas game-environment bump.
+    """
+    talent = float(vorp or 0.0)
+    env = (float(implied) - AVG_TEAM_TOTAL) if implied is not None else 0.0
+    return round(talent * 0.5 + env * 2.0, 1)
+
+
+def roster_detail(roster: dict, player_map: dict, bridge: dict,
+                  games: list = None) -> list:
+    """Turn a Sleeper roster into rich rows for display / start-sit.
+
+    Returns dicts with name/pos/team/bye/vorp/injury, whether they're a current
+    starter, their game opponent, implied total, and a matchup-adjusted score.
+    """
+    starters = set(str(x) for x in (roster.get("starters") or []) if x)
+    reserve = set(str(x) for x in (roster.get("reserve") or []) if x)
+    implied = team_implied_map(games)
+    opps = _opp_map(games)
+    rows = []
+    for pid in (roster.get("players") or []):
+        pid = str(pid)
+        eng = _bridge_player(bridge, pid)
+        info = (player_map or {}).get(pid, {}) if not eng else {}
+        if eng:
+            name, pos, team = eng.name, eng.position, eng.team
+            bye, vorp = eng.bye, eng.vorp
+            inj = getattr(eng, "injury_status", "")
+        else:
+            pos = (info.get("position") or "?").upper()
+            pos = "K" if pos == "PK" else ("DEF" if pos == "DST" else pos)
+            name = (info.get("full_name")
+                    or " ".join(x for x in (info.get("first_name"),
+                                            info.get("last_name")) if x) or pid)
+            team = info.get("team") or "FA"
+            bye, vorp = 0, None
+            inj = info.get("injury_status") or ""
+        disp_pos = "K" if pos == "PK" else ("DEF" if pos == "DST" else pos)
+        opp, homeaway = opps.get(team, ("", ""))
+        imp = implied.get(team)
+        rows.append({
+            "player_id": pid, "name": name, "pos": disp_pos, "team": team,
+            "bye": bye or 0, "vorp": vorp, "injury_status": inj,
+            "is_starter": pid in starters, "is_reserve": pid in reserve,
+            "opp": opp, "homeaway": homeaway, "implied": imp,
+            "score": week_score(vorp, imp),
+        })
+    return rows
+
+
+_FLEX_ELIGIBLE = {"RB", "WR", "TE"}
+
+
+def start_sit(roster_rows: list) -> list:
+    """Suggest lineup swaps where a bench player out-scores a starter.
+
+    Compares within a position (QB/RB/WR/TE/K/DEF) and for FLEX-eligible
+    positions, using the matchup-adjusted week_score. Returns a list of
+    suggestion dicts (bench player, the starter they'd replace, delta).
+    """
+    starters = [r for r in roster_rows if r["is_starter"]]
+    bench = [r for r in roster_rows
+             if not r["is_starter"] and not r["is_reserve"]]
+    suggestions = []
+    used_bench = set()
+    for st in sorted(starters, key=lambda r: r["score"]):
+        pool = [b for b in bench
+                if b["player_id"] not in used_bench
+                and (b["pos"] == st["pos"]
+                     or (st["pos"] in _FLEX_ELIGIBLE
+                         and b["pos"] in _FLEX_ELIGIBLE))]
+        if not pool:
+            continue
+        best = max(pool, key=lambda b: b["score"])
+        if best["score"] - st["score"] >= 3.0:
+            suggestions.append({
+                "start": best, "sit": st,
+                "delta": round(best["score"] - st["score"], 1)})
+            used_bench.add(best["player_id"])
+    suggestions.sort(key=lambda s: -s["delta"])
+    return suggestions
+
+
+def bye_report(my_players: list, current_week: int = 0) -> list:
+    """Upcoming byes on your roster, grouped by week (soonest first)."""
+    from collections import defaultdict
+    weeks = defaultdict(list)
+    for p in my_players or []:
+        bye = getattr(p, "bye", 0) or 0
+        if bye and bye >= (current_week or 0):
+            weeks[bye].append(p)
+    out = []
+    for wk in sorted(weeks):
+        players = weeks[wk]
+        from collections import Counter
+        by_pos = Counter(getattr(p, "position", "?") for p in players)
+        out.append({"week": wk, "players": players, "count": len(players),
+                    "by_pos": dict(by_pos)})
+    return out
+
+
+def parse_transactions(transactions: list, player_map: dict,
+                       labels: dict = None) -> list:
+    """FAAB waiver results: who was added, by whom, for how much."""
+    labels = labels or {}
+    out = []
+    for t in transactions or []:
+        if t.get("status") != "complete":
+            continue
+        if t.get("type") not in ("waiver", "free_agent"):
+            continue
+        bid = ((t.get("settings") or {}).get("waiver_bid"))
+        adds = t.get("adds") or {}
+        if not adds:
+            continue
+        for pid, rid in adds.items():
+            info = (player_map or {}).get(str(pid), {})
+            name = (info.get("full_name")
+                    or " ".join(x for x in (info.get("first_name"),
+                                            info.get("last_name")) if x)
+                    or str(pid))
+            pos = (info.get("position") or "").upper()
+            out.append({
+                "name": name,
+                "pos": "K" if pos == "PK" else pos,
+                "team": info.get("team") or "FA",
+                "manager": labels.get(str(rid), f"Team {rid}"),
+                "bid": bid,
+                "week": t.get("leg"),
+            })
+    out.sort(key=lambda r: (-(r["week"] or 0), -(r["bid"] or 0)))
+    return out
+
+
+def my_matchup(matchups: list, my_roster_id) -> tuple:
+    """Return (my_entry, opponent_entry) for the week, or (None, None)."""
+    mine = next((m for m in matchups or []
+                 if str(m.get("roster_id")) == str(my_roster_id)), None)
+    if not mine:
+        return None, None
+    mid = mine.get("matchup_id")
+    opp = next((m for m in matchups or []
+                if m.get("matchup_id") == mid
+                and str(m.get("roster_id")) != str(my_roster_id)), None)
+    return mine, opp
+
+
+def lineup_rows(entry: dict, player_map: dict, bridge: dict,
+                games: list = None) -> list:
+    """Starting lineup of a matchup entry as display rows (in slot order)."""
+    if not entry:
+        return []
+    implied = team_implied_map(games)
+    opps = _opp_map(games)
+    pts = entry.get("starters_points") or []
+    rows = []
+    for i, pid in enumerate(entry.get("starters") or []):
+        pid = str(pid)
+        if not pid or pid == "0":
+            rows.append({"name": "(empty)", "pos": "", "team": "",
+                         "points": 0, "opp": "", "implied": None})
+            continue
+        eng = _bridge_player(bridge, pid)
+        info = (player_map or {}).get(pid, {}) if not eng else {}
+        if eng:
+            name, pos, team = eng.name, eng.position, eng.team
+        else:
+            pos = (info.get("position") or "?").upper()
+            name = (info.get("full_name")
+                    or " ".join(x for x in (info.get("first_name"),
+                                            info.get("last_name")) if x) or pid)
+            team = info.get("team") or ""
+        disp_pos = "K" if pos == "PK" else ("DEF" if pos == "DST" else pos)
+        opp, homeaway = opps.get(team, ("", ""))
+        rows.append({
+            "name": name, "pos": disp_pos, "team": team,
+            "points": pts[i] if i < len(pts) else 0,
+            "opp": f"{homeaway} {opp}".strip(), "implied": implied.get(team)})
+    return rows
 
 
 if __name__ == "__main__":

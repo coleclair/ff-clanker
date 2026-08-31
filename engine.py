@@ -105,9 +105,14 @@ class Player:
     low: int = 0
     # runtime state
     drafted_by: str = ""   # "" = available, "me" = my team, "other" = someone else
+    sleeper_id: str = ""   # Sleeper player_id, filled in when matched for draft sync
+    injury_status: str = ""  # Sleeper injury tag (Questionable/Out/IR/...), if any
     # computed
     vorp: float = 0.0
     pos_rank: int = 0
+    risk: float = 0.0        # relative volatility (~1.0 = typical for this ADP)
+    upside: float = 0.0      # asymmetric-upside score (higher = bigger sleeper)
+    risk_label: str = ""     # Safe / Volatile / Boom-Bust / Upside / Bust risk / thin
 
     @property
     def available(self) -> bool:
@@ -229,6 +234,7 @@ class Draft:
         self.teams = teams
         self.history: list = []  # list of (player_id, previous_state)
         self._compute_vorp()
+        self._compute_risk()
 
     # ---- replacement-level value (VORP, computed in ADP space) -------------
     def _replacement_ranks(self) -> dict:
@@ -274,6 +280,66 @@ class Draft:
                 for pl in plist:
                     pl.vorp = round((baseline_adp - pl.adp) * coeff, 1)
 
+    # ---- risk / upside (from ADP dispersion) -------------------------------
+    def _compute_risk(self):
+        """Rate each player's boom-bust profile from ADP dispersion.
+
+        The ADP API reports how much drafters DISAGREE about a player via
+        stdev (spread of draft slots), high (earliest pick anyone spent) and
+        low (latest slot anyone waited). A boom-bust / high-upside pick is one
+        the crowd disagrees about AND where the believers reach well above his
+        ADP -- exactly the "could pay off big or bust" profile.
+
+        We normalize each player's stdev against a local baseline (the median
+        stdev of nearby-ADP players), because raw stdev naturally grows the
+        later a player goes. risk ~1.0 means typical volatility for that draft
+        range; >1 means unusually polarizing.
+        """
+        MIN_SAMPLE = 15          # below this, dispersion numbers are noise
+        WINDOW = 20              # ADP-neighbors used for the local baseline
+
+        ranked = sorted(self.players, key=lambda x: x.adp)
+        n = len(ranked)
+        stdevs = [p.stdev for p in ranked]
+
+        def median(vals: list) -> float:
+            s = sorted(v for v in vals if v > 0)
+            if not s:
+                return 0.0
+            m = len(s) // 2
+            return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2.0
+
+        for i, p in enumerate(ranked):
+            lo = max(0, i - WINDOW)
+            hi = min(n, i + WINDOW + 1)
+            baseline = median(stdevs[lo:hi])
+
+            if p.times_drafted < MIN_SAMPLE or baseline <= 0 or p.stdev <= 0:
+                p.risk = 0.0
+                p.upside = 0.0
+                p.risk_label = "thin" if p.times_drafted < MIN_SAMPLE else ""
+                continue
+
+            p.risk = round(p.stdev / baseline, 2)
+
+            # how far the optimists reach up vs. how far the doubters fade him
+            upside_gap = max(0.0, p.adp - p.high) if p.high else 0.0
+            downside_gap = max(0.0, p.low - p.adp) if p.low else 0.0
+            skew = upside_gap - downside_gap
+            p.upside = round(max(0.0, skew) * p.risk, 1)
+
+            # label: volatility drives the tier, skew picks the direction
+            if p.risk < 0.8:
+                p.risk_label = "Safe"
+            elif p.risk <= 1.25:
+                p.risk_label = "Upside" if skew > 3 else "Steady"
+            elif p.risk <= 1.6:
+                p.risk_label = ("Upside" if skew > 3
+                                else "Bust risk" if skew < -3 else "Volatile")
+            else:
+                p.risk_label = ("Boom-Bust" if abs(skew) <= 3
+                                else "Upside" if skew > 0 else "Bust risk")
+
     # ---- draft actions -----------------------------------------------------
     def mark(self, player_id: int, who: str):
         pl = self.by_id.get(player_id)
@@ -295,6 +361,26 @@ class Draft:
         for pl in self.players:
             pl.drafted_by = ""
         self.history.clear()
+
+    def apply_external_picks(self, mapping: dict) -> int:
+        """Apply picks from an external source (e.g. a live Sleeper draft).
+
+        ``mapping`` is ``{player_id: "me"|"other"}``. Only players that are
+        currently available get marked, so this is idempotent and never
+        clobbers picks you made by hand or already synced. Each change is
+        pushed onto the undo history. Returns the number of newly marked
+        players.
+        """
+        changed = 0
+        for pid, who in mapping.items():
+            if who not in ("me", "other"):
+                continue
+            pl = self.by_id.get(pid)
+            if pl and pl.drafted_by == "":
+                self.history.append((pid, pl.drafted_by))
+                pl.drafted_by = who
+                changed += 1
+        return changed
 
     # ---- roster introspection ---------------------------------------------
     def my_players(self) -> list:
@@ -459,7 +545,7 @@ class Draft:
     def top_by_position(self, n: int = 5) -> dict:
         return {pos: self.best_available(pos, n) for pos in POSITIONS}
 
-    def recommendations(self, n: int = 5) -> list:
+    def recommendations(self, n: int = 5, show_upside: bool = False) -> list:
         """
         Smart 'who should I draft right now' list.
 
@@ -470,6 +556,10 @@ class Draft:
           * a small, capped scarcity nudge -> break ties toward tier cliffs
         This avoids the classic VBD trap of recommending a TE/QB run far too
         early.
+
+        When ``show_upside`` is True, a small capped bonus is added for
+        high-upside boom-bust players so those sleepers can crack the list;
+        with it False the scoring is identical to the pure-ADP behavior.
 
         Returns list of (player, score, reason).
         """
@@ -495,15 +585,21 @@ class Draft:
                 cliff = self.position_cliff(p.position)
                 nudge = min(cliff, 25.0) * 0.5 * need * coeff
             score += nudge
+
+            # Optional upside tilt: let the best sleepers surface, capped so
+            # they can never leapfrog a much better-value pick outright.
+            if show_upside:
+                score += min(p.upside, 40.0) * 0.5 * need
+
             scored.append((p, score, need))
 
         scored.sort(key=lambda x: x[1], reverse=True)
         out = []
         for p, score, need in scored[:n]:
-            out.append((p, round(score, 1), self._reason(p, need)))
+            out.append((p, round(score, 1), self._reason(p, need, show_upside)))
         return out
 
-    def _reason(self, p: Player, need: float) -> str:
+    def _reason(self, p: Player, need: float, show_upside: bool = False) -> str:
         bits = []
         if need >= 1.1:
             bits.append(f"fills {pos_label(p.position)} starter need")
@@ -522,6 +618,14 @@ class Draft:
         best_at = self.best_available(p.position, 1)
         if best_at and best_at[0].player_id == p.player_id and cliff >= 12:
             bits.append(f"last of tier ({pos_label(p.position)} drops ~{cliff:g} ADP after)")
+
+        if show_upside:
+            if p.risk_label == "Upside":
+                bits.append("high upside (could pay off big)")
+            elif p.risk_label == "Boom-Bust":
+                bits.append("boom-bust gamble")
+            elif p.risk_label == "Bust risk":
+                bits.append("high bust risk")
 
         if not bits:
             bits.append(f"best {pos_label(p.position)} available")
