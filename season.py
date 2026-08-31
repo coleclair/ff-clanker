@@ -574,6 +574,138 @@ def lineup_rows(entry: dict, player_map: dict, bridge: dict,
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Standings, power rankings, and trade evaluation
+# ---------------------------------------------------------------------------
+_POS_DISP = {"PK": "K", "DEF": "DEF"}
+
+
+def _disp_pos(pos: str) -> str:
+    return _POS_DISP.get(pos, pos)
+
+
+def roster_engines(roster: dict, bridge: dict) -> list:
+    """Engine Player objects for a roster's players (skips deep, unmatched)."""
+    out = []
+    for pid in (roster.get("players") or []):
+        e = (bridge or {}).get(str(pid))
+        if e:
+            out.append(e)
+    return out
+
+
+def position_counts(engines: list) -> dict:
+    from collections import Counter
+    c = Counter()
+    for e in engines:
+        c[getattr(e, "position", "?")] += 1
+    return dict(c)
+
+
+def standings(rosters: list, labels: dict = None) -> list:
+    """League standings from Sleeper roster settings (record + points for)."""
+    labels = labels or {}
+    out = []
+    for r in rosters or []:
+        s = r.get("settings") or {}
+        rid = str(r.get("roster_id"))
+        pf = float(s.get("fpts", 0) or 0) + float(s.get("fpts_decimal", 0) or 0) / 100.0
+        pa = (float(s.get("fpts_against", 0) or 0)
+              + float(s.get("fpts_against_decimal", 0) or 0) / 100.0)
+        out.append({"rid": rid, "label": labels.get(rid, f"Team {rid}"),
+                    "wins": int(s.get("wins", 0) or 0),
+                    "losses": int(s.get("losses", 0) or 0),
+                    "ties": int(s.get("ties", 0) or 0),
+                    "pf": round(pf, 1), "pa": round(pa, 1)})
+    out.sort(key=lambda x: (-x["wins"], -x["pf"]))
+    for i, r in enumerate(out):
+        r["rank"] = i + 1
+    return out
+
+
+def power_rankings(rosters: list, labels: dict, bridge: dict) -> list:
+    """Rank teams by the total VORP of their *current* roster."""
+    labels = labels or {}
+    out = []
+    for r in rosters or []:
+        rid = str(r.get("roster_id"))
+        val = sum(e.vorp for e in roster_engines(r, bridge))
+        out.append({"rid": rid, "label": labels.get(rid, f"Team {rid}"),
+                    "value": round(val, 1),
+                    "n": len(r.get("players") or [])})
+    out.sort(key=lambda x: -x["value"])
+    for i, r in enumerate(out):
+        r["rank"] = i + 1
+    return out
+
+
+def _starter_reqs(cfg) -> dict:
+    """Minimum dedicated starters by base position (flex handled separately)."""
+    if not cfg:
+        return {}
+    return {"QB": cfg.qb, "RB": cfg.rb, "WR": cfg.wr, "TE": cfg.te,
+            "PK": cfg.k, "DEF": cfg.dst}
+
+
+def trade_eval(a_engines: list, give_a_ids: set,
+               b_engines: list, give_b_ids: set, cfg=None) -> dict:
+    """Evaluate a proposed trade between two rosters.
+
+    ``a_engines``/``b_engines`` are the two teams' current engine players;
+    ``give_a_ids``/``give_b_ids`` are the sleeper_ids each side sends away.
+    Returns value swing (VORP) plus positional/needs notes. VORP is zero-sum
+    on a swap, so the side that gains value is the winner on paper.
+    """
+    give_a_ids = set(str(x) for x in (give_a_ids or set()))
+    give_b_ids = set(str(x) for x in (give_b_ids or set()))
+    ga = [e for e in a_engines if e.sleeper_id in give_a_ids]
+    gb = [e for e in b_engines if e.sleeper_id in give_b_ids]
+    give_a_val = sum(e.vorp for e in ga)
+    give_b_val = sum(e.vorp for e in gb)
+    net_a = round(give_b_val - give_a_val, 1)      # A receives gb, sends ga
+
+    a_after = [e for e in a_engines if e.sleeper_id not in give_a_ids] + gb
+    b_after = [e for e in b_engines if e.sleeper_id not in give_b_ids] + ga
+
+    notes = []
+    if cfg and (ga or gb):
+        reqs = _starter_reqs(cfg)
+        for who, before, after in (("You", a_engines, a_after),
+                                   ("They", b_engines, b_after)):
+            pb = position_counts(before)
+            pa = position_counts(after)
+            for pos, req in reqs.items():
+                if not req:
+                    continue
+                b_ok = pb.get(pos, 0) >= req
+                a_ok = pa.get(pos, 0) >= req
+                if b_ok and not a_ok:
+                    notes.append(
+                        f"\u26A0 {who} fall below {req} startable "
+                        f"{_disp_pos(pos)}")
+                elif not b_ok and a_ok:
+                    notes.append(
+                        f"\u2714 {who} now field {req} startable "
+                        f"{_disp_pos(pos)}")
+
+    if not ga and not gb:
+        verdict = "Select players on both sides to evaluate."
+    elif net_a == 0:
+        verdict = "Even swap on value."
+    elif net_a > 0:
+        verdict = f"You win the value: +{net_a:.0f} VORP"
+    else:
+        verdict = f"They win the value: +{-net_a:.0f} VORP"
+
+    return {
+        "net_a": net_a, "net_b": -net_a,
+        "give_a": ga, "give_b": gb,
+        "give_a_val": round(give_a_val, 1), "give_b_val": round(give_b_val, 1),
+        "verdict": verdict, "notes": notes,
+        "a_after": a_after, "b_after": b_after,
+    }
+
+
 if __name__ == "__main__":
     st = get_state(force=True)
     print("state:", state_label(st))

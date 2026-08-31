@@ -292,6 +292,10 @@ class App(tk.Tk):
         self.startsit_var = tk.StringVar(value="")
         self.bye_var = tk.StringVar(value="")
         self.matchup_var = tk.StringVar(value="")
+        # trade analyzer
+        self.trade_opp_var = tk.StringVar()
+        self.trade_result_var = tk.StringVar(value="")
+        self._trade_opp_label_to_rid: dict = {}
 
         self._load_league_settings()
         self.theme_var.set(self.theme_name)
@@ -1089,19 +1093,27 @@ class App(tk.Tk):
         pg_waivers = tk.Frame(self.snb, bg=C_BG)
         pg_team = tk.Frame(self.snb, bg=C_BG)
         pg_matchup = tk.Frame(self.snb, bg=C_BG)
+        pg_league = tk.Frame(self.snb, bg=C_BG)
+        pg_trade = tk.Frame(self.snb, bg=C_BG)
         pg_news = tk.Frame(self.snb, bg=C_BG)
         self.snb.add(pg_waivers, text="  Waivers & FAAB  ")
         self.snb.add(pg_team, text="  My Team  ")
         self.snb.add(pg_matchup, text="  Matchup  ")
+        self.snb.add(pg_league, text="  League  ")
+        self.snb.add(pg_trade, text="  Trade  ")
         self.snb.add(pg_news, text="  News & Injuries  ")
 
         self._build_waivers_page(pg_waivers)
         self._build_myteam_page(pg_team)
         self._build_matchup_page(pg_matchup)
+        self._build_league_page(pg_league)
+        self._build_trade_page(pg_trade)
         self._build_news_page(pg_news)
 
         trees = [self.news_tree, self.inj_tree, self.fa_tree, self.faab_tree,
-                 self.str_tree, self.myroster_tree, self.me_tree, self.opp_tree]
+                 self.str_tree, self.myroster_tree, self.me_tree, self.opp_tree,
+                 self.standings_tree, self.power_tree,
+                 self.trade_me_tree, self.trade_opp_tree]
         for t in trees:
             self._apply_row_tags(t)
             t.tag_configure("group", font=("Segoe UI Semibold", 10, "bold"),
@@ -1224,6 +1236,81 @@ class App(tk.Tk):
         self._section_header(rf, "\U0001F94A Opponent", "#e5484d").pack(
             anchor="w", fill="x", padx=12, pady=(10, 6))
         self.opp_tree = self._tree_in(rf, ("pos", "opp", "pts"), cols)
+
+    def _build_league_page(self, parent):
+        split = tk.PanedWindow(parent, orient="horizontal", bg=C_BG,
+                               sashwidth=8, bd=0, sashrelief="flat")
+        split.pack(side="top", fill="both", expand=True)
+        left = tk.Frame(split, bg=C_PANEL)
+        right = tk.Frame(split, bg=C_PANEL)
+        split.add(left, minsize=380, width=520, stretch="always")
+        split.add(right, minsize=300, width=380, stretch="always")
+
+        self._section_header(left, "\U0001F3C5 Standings", C_ACCENT2,
+                             hint="record \u00b7 points for").pack(
+            anchor="w", fill="x", padx=12, pady=(10, 6))
+        self.standings_tree = self._tree_in(
+            left, ("rec", "pf", "pa"), {
+                "#0": ("Team", 190, "w", True),
+                "rec": ("W-L-T", 80, "center", False),
+                "pf": ("PF", 74, "e", False),
+                "pa": ("PA", 74, "e", False)})
+
+        self._section_header(right, "\U0001F4AA Power Rankings", C_GOLD,
+                             hint="by current roster value (VORP)").pack(
+            anchor="w", fill="x", padx=12, pady=(10, 6))
+        self.power_tree = self._tree_in(
+            right, ("value", "n"), {
+                "#0": ("Team", 190, "w", True),
+                "value": ("Value", 74, "e", False),
+                "n": ("Plrs", 50, "center", False)})
+
+    def _build_trade_page(self, parent):
+        top = tk.Frame(parent, bg=C_BG)
+        top.pack(side="top", fill="x", pady=(8, 2), padx=4)
+        ttk.Label(top, text="Trade with:", style="Status.TLabel").pack(
+            side="left", padx=(0, 6))
+        self.trade_combo = ttk.Combobox(top, textvariable=self.trade_opp_var,
+                                        state="readonly", width=30, values=[])
+        self.trade_combo.pack(side="left")
+        self.trade_combo.bind("<<ComboboxSelected>>",
+                              lambda e: self._on_trade_opp_change())
+        ttk.Label(top,
+                  text="  \u2013  Ctrl/Shift-click players on each side to include",
+                  style="Status.TLabel").pack(side="left", padx=(10, 0))
+
+        body = tk.Frame(parent, bg=C_BG)
+        body.pack(side="top", fill="both", expand=True)
+        body.columnconfigure(0, weight=1, uniform="tr")
+        body.columnconfigure(1, weight=1, uniform="tr")
+        body.rowconfigure(0, weight=1)
+        cols = {"#0": ("Player", 170, "w", True),
+                "pos": ("Pos", 48, "center", False),
+                "team": ("Tm", 46, "center", False),
+                "vorp": ("VORP", 62, "e", False)}
+        lf = tk.Frame(body, bg=C_PANEL)
+        lf.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self._section_header(lf, "\u2B50 You send", C_ACCENT2).pack(
+            anchor="w", fill="x", padx=12, pady=(10, 6))
+        self.trade_me_tree = self._tree_in(lf, ("pos", "team", "vorp"), cols)
+        self.trade_me_tree.configure(selectmode="extended")
+        self.trade_me_tree.bind("<<TreeviewSelect>>",
+                                lambda e: self._eval_trade())
+        rf = tk.Frame(body, bg=C_PANEL)
+        rf.grid(row=0, column=1, sticky="nsew")
+        self._section_header(rf, "\U0001F91D You receive", "#e5484d").pack(
+            anchor="w", fill="x", padx=12, pady=(10, 6))
+        self.trade_opp_tree = self._tree_in(rf, ("pos", "team", "vorp"), cols)
+        self.trade_opp_tree.configure(selectmode="extended")
+        self.trade_opp_tree.bind("<<TreeviewSelect>>",
+                                 lambda e: self._eval_trade())
+
+        res = tk.Frame(parent, bg=C_PANEL)
+        res.pack(side="top", fill="x")
+        tk.Label(res, textvariable=self.trade_result_var, bg=C_PANEL, fg=C_GOLD,
+                 font=("Segoe UI Semibold", 11, "bold"), anchor="w",
+                 justify="left", wraplength=900).pack(
+            fill="x", padx=14, pady=(8, 10))
 
     def _build_news_page(self, parent):
         bar = tk.Frame(parent, bg=C_BG)
@@ -1350,6 +1437,8 @@ class App(tk.Tk):
         self._render_streaming()
         self._render_myroster()
         self._render_matchup()
+        self._render_league()
+        self._render_trade()
         label = season.state_label(res.get("state", {}))
         errs = [k.replace("_err", "") for k in res if k.endswith("_err")]
         msg = label or "Season data loaded."
@@ -1666,6 +1755,126 @@ class App(tk.Tk):
         fill(self.me_tree, mine)
         fill(self.opp_tree, opp)
 
+    # ---- league standings / power rankings --------------------------------
+    def _roster_engines_for(self, rid):
+        bridge = self._sync_bridge or {}
+        r = next((x for x in self._season_data.get("rosters", []) or []
+                  if str(x.get("roster_id")) == str(rid)), {})
+        return season.roster_engines(r, bridge)
+
+    def _render_league(self):
+        if not hasattr(self, "standings_tree"):
+            return
+        data = self._season_data
+        rosters = data.get("rosters", []) or []
+        labels = data.get("labels", {})
+        my_rid = str((self.sleeper or {}).get("roster_id"))
+
+        self.standings_tree.delete(*self.standings_tree.get_children())
+        st = season.standings(rosters, labels)
+        if not st:
+            self.standings_tree.insert(
+                "", "end", text="  (link your Sleeper league)",
+                values=("", "", ""), tags=("empty",))
+        for r in st:
+            tags = (("mine_row",) if r["rid"] == my_rid
+                    else (("row_odd",) if r["rank"] % 2 else ("row_even",)))
+            star = "\u2605 " if r["rid"] == my_rid else ""
+            rec = (f"{r['wins']}-{r['losses']}"
+                   + (f"-{r['ties']}" if r["ties"] else ""))
+            self.standings_tree.insert(
+                "", "end", text=f"  {r['rank']}. {star}{r['label']}",
+                values=(rec, f"{r['pf']:.1f}", f"{r['pa']:.1f}"), tags=tags)
+
+        self.power_tree.delete(*self.power_tree.get_children())
+        pr = season.power_rankings(rosters, labels, self._sync_bridge or {})
+        if pr and any(r["value"] for r in pr):
+            for r in pr:
+                tags = (("mine_row",) if r["rid"] == my_rid
+                        else (("row_odd",) if r["rank"] % 2 else ("row_even",)))
+                star = "\u2605 " if r["rid"] == my_rid else ""
+                self.power_tree.insert(
+                    "", "end", text=f"  {r['rank']}. {star}{r['label']}",
+                    values=(f"{r['value']:+.0f}", r["n"]), tags=tags)
+        else:
+            self.power_tree.insert(
+                "", "end", text="  (fills in after the draft)",
+                values=("", ""), tags=("empty",))
+
+    # ---- trade analyzer ---------------------------------------------------
+    def _render_trade(self):
+        if not hasattr(self, "trade_me_tree"):
+            return
+        labels = self._season_data.get("labels", {})
+        my_rid = str((self.sleeper or {}).get("roster_id"))
+        self._trade_opp_label_to_rid = {}
+        vals = []
+        for rid, lbl in sorted(labels.items(),
+                               key=lambda kv: (int(kv[0]) if kv[0].isdigit()
+                                               else 9999)):
+            if str(rid) == my_rid:
+                continue
+            self._trade_opp_label_to_rid[lbl] = rid
+            vals.append(lbl)
+        self.trade_combo.configure(values=vals)
+        if self.trade_opp_var.get() not in self._trade_opp_label_to_rid and vals:
+            self.trade_opp_var.set(vals[0])
+        self._fill_trade_tree(self.trade_me_tree, my_rid)
+        self._on_trade_opp_change()
+
+    def _on_trade_opp_change(self):
+        rid = self._trade_opp_label_to_rid.get(self.trade_opp_var.get())
+        self._fill_trade_tree(self.trade_opp_tree, rid)
+        self._eval_trade()
+
+    def _fill_trade_tree(self, tree, rid):
+        tree.delete(*tree.get_children())
+        if rid is None:
+            return
+        engs = self._roster_engines_for(rid)
+        if not engs:
+            tree.insert("", "end", text="  (roster fills in after the draft)",
+                        values=("", "", ""), tags=("empty",))
+            return
+        order = {"QB": 0, "RB": 1, "WR": 2, "TE": 3, "PK": 4, "DEF": 5}
+        for i, e in enumerate(sorted(
+                engs, key=lambda x: (order.get(x.position, 9), -x.vorp))):
+            stripe = "row_odd" if i % 2 else "row_even"
+            pos = "K" if e.position == "PK" else e.position
+            tags = [stripe]
+            if pos in POS_COLORS:
+                tags.append(f"pos_{pos}")
+            code = injury_code(getattr(e, "injury_status", ""))
+            nm = "  " + e.name + (f"  {code}" if code else "")
+            tree.insert("", "end", iid=f"tr:{e.sleeper_id}", text=nm,
+                        values=(pos, e.team, f"{e.vorp:+.0f}"), tags=tuple(tags))
+
+    def _selected_sids(self, tree):
+        return {iid[3:] for iid in tree.selection() if iid.startswith("tr:")}
+
+    def _eval_trade(self):
+        if not hasattr(self, "trade_me_tree"):
+            return
+        my_rid = str((self.sleeper or {}).get("roster_id"))
+        opp_rid = self._trade_opp_label_to_rid.get(self.trade_opp_var.get())
+        a_eng = self._roster_engines_for(my_rid)
+        b_eng = self._roster_engines_for(opp_rid) if opp_rid else []
+        res = season.trade_eval(a_eng, self._selected_sids(self.trade_me_tree),
+                                b_eng, self._selected_sids(self.trade_opp_tree),
+                                self.roster_config)
+        parts = [res["verdict"]]
+        if res["give_a"] or res["give_b"]:
+            send = ", ".join(f"{e.name} ({e.vorp:+.0f})"
+                             for e in res["give_a"]) or "\u2014"
+            recv = ", ".join(f"{e.name} ({e.vorp:+.0f})"
+                             for e in res["give_b"]) or "\u2014"
+            parts.append(f"Send: {send}")
+            parts.append(f"Get:  {recv}")
+        if res["notes"]:
+            parts.append("      ".join(res["notes"]))
+        self.trade_result_var.set(
+            parts[0] if len(parts) == 1 else "\n".join(parts))
+
     def _render_streaming(self):
         self.str_tree.delete(*self.str_tree.get_children())
         streamers = self._season_data.get("streamers")
@@ -1883,6 +2092,8 @@ class App(tk.Tk):
             self._render_streaming()
             self._render_myroster()
             self._render_matchup()
+            self._render_league()
+            self._render_trade()
 
     def open_settings(self):
         SettingsDialog(self)
