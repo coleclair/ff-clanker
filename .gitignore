@@ -11,6 +11,13 @@ draft_autosave.json
 league_settings.json
 *.lnk
 
+# Personal / third-party rankings spreadsheets (kept local, not published).
+# Want yours to sync to another PC via GitHub? Force-add it: git add -f the-file.xlsx
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
 # OS cruft
 Thumbs.db
 .DS_Store

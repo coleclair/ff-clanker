@@ -41,6 +41,7 @@ from engine import (
     pos_label,
     load_players,
     cache_age_string,
+    load_manual_rankings,
 )
 import season
 import sleeper
@@ -245,6 +246,15 @@ class App(tk.Tk):
         self.hide_drafted_var = tk.BooleanVar(value=True)
         self.show_upside_var = tk.BooleanVar(value=False)
 
+        # Manual rankings overlay (a friend's ranked spreadsheet)
+        self.use_manual_var = tk.BooleanVar(value=False)
+        self.manual_influence_var = tk.DoubleVar(value=100.0)  # percent
+        self.manual_pct_var = tk.StringVar(value="100%")
+        self.manual_status_var = tk.StringVar(value="")
+        self._manual_entries: list = []
+        self._manual_path = None
+        self._manual_after = None
+
         # Sleeper linkage + live draft sync
         self.sleeper: dict = {}
         self.sync_var = tk.BooleanVar(value=False)
@@ -298,6 +308,7 @@ class App(tk.Tk):
         self._trade_opp_label_to_rid: dict = {}
 
         self._load_league_settings()
+        self._init_manual_rankings()
         self.theme_var.set(self.theme_name)
         apply_palette(self.theme_name)
         self._build_style()
@@ -628,6 +639,26 @@ class App(tk.Tk):
                         variable=self.show_upside_var,
                         command=self._on_toggle_upside,
                         style="TCheckbutton").pack(side="right", padx=(0, 12))
+
+        # Manual rankings overlay (a friend's ranked spreadsheet)
+        manual = tk.Frame(parent, bg=C_PANEL)
+        manual.pack(fill="x", padx=12, pady=(0, 4))
+        self.manual_check = ttk.Checkbutton(
+            manual, text="\U0001F4CB  Manual rankings", variable=self.use_manual_var,
+            command=self._on_toggle_manual, style="TCheckbutton")
+        self.manual_check.pack(side="left")
+        ttk.Label(manual, text="influence", style="Muted.TLabel").pack(
+            side="left", padx=(12, 4))
+        self.manual_scale = ttk.Scale(
+            manual, from_=0, to=100, orient="horizontal", length=110,
+            variable=self.manual_influence_var, command=self._on_manual_influence)
+        self.manual_scale.pack(side="left")
+        ttk.Label(manual, textvariable=self.manual_pct_var,
+                  style="Muted.TLabel").pack(side="left", padx=(4, 0))
+        ttk.Button(manual, text="Load file\u2026",
+                   command=self._pick_manual_file).pack(side="left", padx=(12, 0))
+        ttk.Label(manual, textvariable=self.manual_status_var,
+                  style="Muted.TLabel").pack(side="left", padx=(12, 0))
 
         # Sleeper live-draft sync
         sync = tk.Frame(parent, bg=C_PANEL)
@@ -1961,8 +1992,7 @@ class App(tk.Tk):
         self.meta = meta
         self.source = source
 
-        self.draft = Draft(players, self._roster_copy(),
-                           teams=int(self.teams_var.get()))
+        self.draft = self._build_draft(players)
 
         if prev_state:
             self.draft.apply_state(prev_state)
@@ -2041,6 +2071,15 @@ class App(tk.Tk):
             self.theme_name = data["theme"]
         if isinstance(data.get("show_upside"), bool):
             self.show_upside_var.set(data["show_upside"])
+        if isinstance(data.get("use_manual"), bool):
+            self.use_manual_var.set(data["use_manual"])
+        if isinstance(data.get("manual_influence"), (int, float)):
+            self.manual_influence_var.set(
+                max(0.0, min(100.0, float(data["manual_influence"]))))
+            self.manual_pct_var.set(
+                f"{int(round(self.manual_influence_var.get()))}%")
+        if isinstance(data.get("manual_path"), str) and data["manual_path"]:
+            self._manual_path = data["manual_path"]
         if isinstance(data.get("sleeper"), dict):
             self.sleeper = data["sleeper"]
         roster = data.get("roster")
@@ -2057,6 +2096,9 @@ class App(tk.Tk):
                     "teams": int(self.teams_var.get()),
                     "theme": self.theme_name,
                     "show_upside": bool(self.show_upside_var.get()),
+                    "use_manual": bool(self.use_manual_var.get()),
+                    "manual_influence": float(self.manual_influence_var.get()),
+                    "manual_path": self._manual_path or "",
                     "sleeper": self.sleeper,
                     "roster": dataclasses.asdict(self.roster_config),
                 }, f, indent=2)
@@ -2120,8 +2162,7 @@ class App(tk.Tk):
 
         # roster changed: rebuild the draft in place, keep picks
         prev_state = self.draft.state() if self.draft else None
-        self.draft = Draft(self.players, self._roster_copy(),
-                           teams=int(self.teams_var.get()))
+        self.draft = self._build_draft(self.players)
         if prev_state:
             self.draft.apply_state(prev_state)
 
@@ -2506,8 +2547,7 @@ class App(tk.Tk):
             return
         _, players, meta, source, state = msg
         self.players, self.meta, self.source = players, meta, source
-        self.draft = Draft(players, self._roster_copy(),
-                           teams=int(self.teams_var.get()))
+        self.draft = self._build_draft(players)
         self.draft.apply_state(state)
         self._save_league_settings()
         self._update_league_label()
@@ -2532,6 +2572,7 @@ class App(tk.Tk):
         self._render_recommendations()
         self._render_positions()
         self._render_team()
+        self._update_manual_status()
 
     def _update_filter_buttons(self):
         active = self.filter_var.get()
@@ -2544,6 +2585,122 @@ class App(tk.Tk):
     def _on_toggle_upside(self):
         self.refresh_views()
         self._save_league_settings()
+
+    # ---------------------------------------------------------- manual ranks
+    def _manual_blend(self) -> float:
+        return max(0.0, min(1.0, self.manual_influence_var.get() / 100.0))
+
+    def _apply_manual(self, draft):
+        """Push the current manual-rankings state onto a Draft object."""
+        if not draft:
+            return
+        draft.apply_manual(self._manual_entries, self.use_manual_var.get(),
+                           self._manual_blend())
+
+    def _build_draft(self, players):
+        """Build a Draft and apply the manual-rankings overlay to it."""
+        d = Draft(players, self._roster_copy(), teams=int(self.teams_var.get()))
+        self._apply_manual(d)
+        return d
+
+    def _auto_find_rankings(self):
+        """Look for a rankings spreadsheet sitting in the app folder."""
+        import glob
+        found = []
+        for pat in ("*rank*.xlsx", "*rank*.xlsm", "*rank*.csv",
+                    "*Rankings*.xlsx", "*Rankings*.csv"):
+            found += glob.glob(os.path.join(APP_DIR, pat))
+        found = [f for f in set(found) if os.path.isfile(f)]
+        found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return found[0] if found else None
+
+    def _init_manual_rankings(self, path=None, announce=False) -> bool:
+        """Load a rankings file (given, remembered, or auto-detected)."""
+        candidate = path or self._manual_path or self._auto_find_rankings()
+        if not candidate or not os.path.exists(candidate):
+            self._manual_entries = []
+            if candidate is None and self.use_manual_var.get():
+                self.use_manual_var.set(False)
+            if announce and candidate:
+                messagebox.showerror("Manual rankings",
+                                     f"File not found:\n{candidate}")
+            self._update_manual_status()
+            return False
+        try:
+            entries = load_manual_rankings(candidate)
+        except Exception as e:
+            self._manual_entries = []
+            if self.use_manual_var.get():
+                self.use_manual_var.set(False)
+            if announce:
+                messagebox.showerror(
+                    "Manual rankings",
+                    f"Couldn't read that rankings file:\n\n{e}\n\n"
+                    "Expected columns like Overall / Position / Player.")
+            self._update_manual_status()
+            return False
+        self._manual_entries = entries
+        self._manual_path = candidate
+        self._update_manual_status()
+        return True
+
+    def _update_manual_status(self):
+        self.manual_pct_var.set(f"{int(round(self.manual_influence_var.get()))}%")
+        if not self._manual_entries:
+            self.manual_status_var.set("no rankings file loaded")
+            return
+        name = os.path.basename(self._manual_path or "rankings")
+        total = len(self._manual_entries)
+        matched = getattr(self.draft, "manual_matched", 0) if self.draft else 0
+        if self.use_manual_var.get() and self.draft:
+            self.manual_status_var.set(f"{name}  \u00b7  {matched}/{total} matched")
+        else:
+            self.manual_status_var.set(f"{name}  \u00b7  {total} players (off)")
+
+    def _on_toggle_manual(self):
+        if self.use_manual_var.get() and not self._manual_entries:
+            # try to find/read a file; if that fails, let the user pick one
+            if not self._init_manual_rankings(announce=False):
+                if not self._pick_manual_file():
+                    self.use_manual_var.set(False)
+                    self._update_manual_status()
+                    return
+        self._apply_manual(self.draft)
+        self.refresh_views()
+        self._update_manual_status()
+        self._save_league_settings()
+
+    def _on_manual_influence(self, _=None):
+        self.manual_pct_var.set(f"{int(round(self.manual_influence_var.get()))}%")
+        if self._manual_after:
+            self.after_cancel(self._manual_after)
+        self._manual_after = self.after(120, self._commit_manual_influence)
+
+    def _commit_manual_influence(self):
+        self._manual_after = None
+        if self.use_manual_var.get() and self.draft:
+            self._apply_manual(self.draft)
+            self.refresh_views()
+            self._update_manual_status()
+        self._save_league_settings()
+
+    def _pick_manual_file(self) -> bool:
+        path = filedialog.askopenfilename(
+            title="Choose your rankings file",
+            initialdir=APP_DIR,
+            filetypes=[("Rankings", "*.xlsx *.xlsm *.csv"),
+                       ("Excel", "*.xlsx *.xlsm"), ("CSV", "*.csv"),
+                       ("All files", "*.*")])
+        if not path:
+            return False
+        if not self._init_manual_rankings(path=path, announce=True):
+            return False
+        self.use_manual_var.set(True)
+        self._apply_manual(self.draft)
+        self.refresh_views()
+        self._update_manual_status()
+        self._save_league_settings()
+        return True
 
     def _render_available(self):
         self.tree.delete(*self.tree.get_children())

@@ -1,2 +1,3 @@
 requests>=2.31
 truststore>=0.9   ; uses the OS certificate store so HTTPS works behind corporate proxies
+openpyxl>=3.1     ; reads .xlsx manual-rankings files (the "Manual rankings" toggle)

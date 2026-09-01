@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
+import unicodedata
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 
@@ -103,6 +105,12 @@ class Player:
     times_drafted: int = 0
     high: int = 0
     low: int = 0
+    # manual-rankings support (a friend's ranked list layered over crowd ADP)
+    crowd_adp: float = 0.0     # the raw crowd ADP, kept for display
+    eff_adp: float = 0.0       # what the engine ranks by (== adp unless manual)
+    manual_rank: int = 0       # buddy's overall rank (0 = not in the file)
+    manual_pos_rank: int = 0   # buddy's positional rank (RB7 -> 7)
+    manual_pos: str = ""       # buddy's position label (QB/RB/WR/TE)
     # runtime state
     drafted_by: str = ""   # "" = available, "me" = my team, "other" = someone else
     sleeper_id: str = ""   # Sleeper player_id, filled in when matched for draft sync
@@ -186,7 +194,7 @@ def _players_from_raw(raw: list) -> list:
     players = []
     for p in raw:
         try:
-            players.append(Player(
+            pl = Player(
                 player_id=int(p["player_id"]),
                 name=p["name"],
                 position=p["position"],
@@ -197,7 +205,10 @@ def _players_from_raw(raw: list) -> list:
                 times_drafted=int(p.get("times_drafted") or 0),
                 high=int(p.get("high") or 0),
                 low=int(p.get("low") or 0),
-            ))
+            )
+            pl.crowd_adp = pl.adp
+            pl.eff_adp = pl.adp
+            players.append(pl)
         except (KeyError, ValueError, TypeError):
             continue
     players.sort(key=lambda x: x.adp)
@@ -223,6 +234,148 @@ def cache_age_string(meta: dict, source: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Manual rankings (a friend's ranked list layered on top of crowd ADP)
+# ---------------------------------------------------------------------------
+
+# Position labels a ranking file might use -> our internal codes.
+_MANUAL_POS_MAP = {
+    "QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE",
+    "K": "PK", "PK": "PK", "KI": "PK",
+    "DEF": "DEF", "DST": "DEF", "DST/D": "DEF", "D": "DEF", "DS": "DEF",
+}
+
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+
+def normalize_name(name: str) -> str:
+    """Loose player-name key so 'Ja'Marr Chase' == 'jamarr chase' etc."""
+    if not name:
+        return ""
+    s = unicodedata.normalize("NFKD", str(name))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.lower().replace("&", " ")
+    s = re.sub(r"[.'`\u2019]", "", s)        # drop periods / apostrophes
+    s = re.sub(r"[^a-z0-9]+", " ", s)         # any other punctuation -> space
+    parts = [p for p in s.split() if p and p not in _NAME_SUFFIXES]
+    return " ".join(parts)
+
+
+def _split_manual_pos(cell) -> tuple:
+    """'RB7' -> ('RB', 7); 'QB' -> ('QB', 0); 'DST3' -> ('DEF', 3)."""
+    if cell is None:
+        return "", 0
+    m = re.match(r"^\s*([A-Za-z/]+?)\s*0*(\d*)\s*$", str(cell))
+    if not m:
+        return "", 0
+    raw = re.sub(r"[^A-Za-z]", "", m.group(1)).upper()
+    pos = _MANUAL_POS_MAP.get(raw, raw)
+    rank = int(m.group(2)) if m.group(2) else 0
+    return pos, rank
+
+
+# Header aliases -> the field we store it as.
+_HEADER_ALIASES = {
+    "overall": "overall", "rank": "overall", "rk": "overall", "ovr": "overall",
+    "overall rank": "overall", "#": "overall",
+    "position": "position", "pos": "position",
+    "player": "name", "name": "name", "players": "name", "player name": "name",
+    "team": "team", "tm": "team",
+    "bye": "bye", "bye week": "bye",
+}
+
+
+def _rows_from_file(path: str) -> list:
+    """Return the raw rows (list of tuples) from an .xlsx or .csv file."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xlsm", ".xls"):
+        import openpyxl  # imported lazily so the rest of the app never needs it
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        ws = wb.active
+        rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
+        wb.close()
+        return rows
+    if ext == ".csv":
+        import csv
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            return [tuple(r) for r in csv.reader(f)]
+    raise ValueError(f"Unsupported rankings file type: {ext}")
+
+
+def load_manual_rankings(path: str) -> list:
+    """Parse a rankings spreadsheet into a list of entry dicts.
+
+    Each entry is ``{name, norm, overall, pos, pos_rank, team, bye}``.
+    Robust to column order / extra columns; needs at least a player-name
+    column. Overall rank falls back to row order if there's no rank column.
+    Raises on a missing file or an unreadable/empty sheet.
+    """
+    rows = [r for r in _rows_from_file(path) if r is not None and any(
+        c not in (None, "") for c in r)]
+    if not rows:
+        raise ValueError("The rankings file is empty.")
+
+    # Find the header row: the first row that names a player column plus one
+    # more known column. Scan the first few rows in case of title banners.
+    header_idx, colmap = None, {}
+    for i, row in enumerate(rows[:8]):
+        m = {}
+        for j, cell in enumerate(row):
+            key = _HEADER_ALIASES.get(str(cell).strip().lower()) if cell else None
+            if key and key not in m:
+                m[key] = j
+        if "name" in m and len(m) >= 2:
+            header_idx, colmap = i, m
+            break
+
+    entries = []
+    if header_idx is not None:
+        for n, row in enumerate(rows[header_idx + 1:], start=1):
+            def cell(field):
+                j = colmap.get(field)
+                return row[j] if j is not None and j < len(row) else None
+
+            name = cell("name")
+            if not name or not str(name).strip():
+                continue
+            pos, pos_rank = _split_manual_pos(cell("position"))
+            overall = cell("overall")
+            try:
+                overall = int(float(overall))
+            except (TypeError, ValueError):
+                overall = n
+            try:
+                bye = int(float(cell("bye")))
+            except (TypeError, ValueError):
+                bye = 0
+            entries.append({
+                "name": str(name).strip(),
+                "norm": normalize_name(name),
+                "overall": overall,
+                "pos": pos,
+                "pos_rank": pos_rank,
+                "team": (str(cell("team")).strip() if cell("team") else ""),
+                "bye": bye,
+            })
+    else:
+        # No recognizable header: assume "rank, position, player, ..." order
+        # and use row position as the overall rank.
+        for n, row in enumerate(rows, start=1):
+            name = row[2] if len(row) > 2 else (row[-1] if row else None)
+            if not name:
+                continue
+            pos, pos_rank = _split_manual_pos(row[1] if len(row) > 1 else None)
+            entries.append({
+                "name": str(name).strip(), "norm": normalize_name(name),
+                "overall": n, "pos": pos, "pos_rank": pos_rank,
+                "team": "", "bye": 0,
+            })
+
+    if not entries:
+        raise ValueError("No player rows found in the rankings file.")
+    return entries
+
+
+# ---------------------------------------------------------------------------
 # Draft state + recommendation engine
 # ---------------------------------------------------------------------------
 
@@ -233,6 +386,16 @@ class Draft:
         self.roster = roster
         self.teams = teams
         self.history: list = []  # list of (player_id, previous_state)
+        # manual-rankings overlay state
+        self.manual_enabled = False
+        self.manual_blend = 1.0
+        self.manual_matched = 0
+        self.manual_total = 0
+        for p in players:
+            if not p.crowd_adp:
+                p.crowd_adp = p.adp
+            if not p.eff_adp:
+                p.eff_adp = p.adp
         self._compute_vorp()
         self._compute_risk()
 
@@ -268,17 +431,17 @@ class Draft:
             if pl.position in by_pos:
                 by_pos[pl.position].append(pl)
         for pos, plist in by_pos.items():
-            plist.sort(key=lambda x: x.adp)
+            plist.sort(key=lambda x: x.eff_adp)
             rank = repl_ranks.get(pos, len(plist))
             coeff = self._pos_value_coeff(pos)
             if plist:
                 idx = min(rank, len(plist)) - 1
-                baseline_adp = plist[idx].adp
+                baseline_adp = plist[idx].eff_adp
                 # if our baseline rank is deeper than the pool, penalize.
                 if rank > len(plist):
-                    baseline_adp = plist[-1].adp + (rank - len(plist)) * 3
+                    baseline_adp = plist[-1].eff_adp + (rank - len(plist)) * 3
                 for pl in plist:
-                    pl.vorp = round((baseline_adp - pl.adp) * coeff, 1)
+                    pl.vorp = round((baseline_adp - pl.eff_adp) * coeff, 1)
 
     # ---- risk / upside (from ADP dispersion) -------------------------------
     def _compute_risk(self):
@@ -381,6 +544,56 @@ class Draft:
                 pl.drafted_by = who
                 changed += 1
         return changed
+
+    # ---- manual rankings overlay ------------------------------------------
+    def apply_manual(self, entries: list, enabled: bool = True,
+                     blend: float = 1.0) -> int:
+        """Layer a friend's ranked list over crowd ADP.
+
+        ``entries`` come from :func:`load_manual_rankings`. When enabled, each
+        matched player's ranking value (``eff_adp``) is nudged toward where the
+        friend slots him -- ``blend`` (0..1) controls how much: 1.0 fully trusts
+        the friend's order, 0.0 ignores it. The friend's overall rank is mapped
+        onto the real ADP scale so magnitudes stay sane and unranked players
+        (e.g. K/DEF) keep their crowd ADP. Recomputes value and returns the
+        number of players matched.
+        """
+        entries = entries or []
+        self.manual_enabled = bool(enabled and entries)
+        self.manual_blend = max(0.0, min(1.0, float(blend)))
+        self.manual_total = len(entries)
+
+        # reset overlay
+        for p in self.players:
+            p.eff_adp = p.crowd_adp or p.adp
+            p.manual_rank = 0
+            p.manual_pos_rank = 0
+            p.manual_pos = ""
+
+        matched = 0
+        if self.manual_enabled:
+            index = {}
+            for e in entries:
+                index.setdefault(e["norm"], e)
+            # map an overall rank onto the crowd-ADP scale
+            scale = sorted(p.crowd_adp or p.adp for p in self.players)
+            n = len(scale)
+            b = self.manual_blend
+            for p in self.players:
+                e = index.get(normalize_name(p.name))
+                if not e:
+                    continue
+                matched += 1
+                p.manual_rank = e["overall"]
+                p.manual_pos_rank = e["pos_rank"]
+                p.manual_pos = e["pos"]
+                r = max(1, e["overall"])
+                pseudo = scale[min(r - 1, n - 1)] if n else float(r)
+                p.eff_adp = b * pseudo + (1.0 - b) * (p.crowd_adp or p.adp)
+
+        self.manual_matched = matched
+        self._compute_vorp()
+        return matched
 
     # ---- roster introspection ---------------------------------------------
     def my_players(self) -> list:
@@ -529,9 +742,9 @@ class Draft:
         """
         avail = sorted((p for p in self.players
                         if p.available and p.position == pos),
-                       key=lambda x: x.adp)
+                       key=lambda x: x.eff_adp)
         if len(avail) >= 2:
-            return round(avail[1].adp - avail[0].adp, 1)
+            return round(avail[1].eff_adp - avail[0].eff_adp, 1)
         return 0.0
 
     # ---- the actual recommendations ---------------------------------------
@@ -539,7 +752,7 @@ class Draft:
         avail = [p for p in self.players if p.available]
         if pos:
             avail = [p for p in avail if p.position == pos]
-        avail.sort(key=lambda x: x.adp)
+        avail.sort(key=lambda x: x.eff_adp)
         return avail[:n]
 
     def top_by_position(self, n: int = 5) -> dict:
@@ -574,7 +787,8 @@ class Draft:
             # 1-QB leagues, TE) so we don't reach for them early.
             coeff = self._pos_value_coeff(p.position)
             # ADP value: lower ADP = higher value, on a positive scale.
-            base_value = max(0.0, 220.0 - p.adp)
+            # eff_adp == crowd ADP unless the manual-rankings overlay is on.
+            base_value = max(0.0, 220.0 - p.eff_adp)
             score = base_value * need * coeff
 
             # Small scarcity nudge, only for the best available at a position,
@@ -601,6 +815,11 @@ class Draft:
 
     def _reason(self, p: Player, need: float, show_upside: bool = False) -> str:
         bits = []
+        if self.manual_enabled and p.manual_rank:
+            tag = (f"{p.manual_pos}{p.manual_pos_rank}"
+                   if p.manual_pos and p.manual_pos_rank else "")
+            bits.append(f"your rankings: #{p.manual_rank}"
+                        + (f" ({tag})" if tag else ""))
         if need >= 1.1:
             bits.append(f"fills {pos_label(p.position)} starter need")
         elif need >= 0.8:

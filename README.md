@@ -111,6 +111,32 @@ Click **League Settings** (top bar) to match your league exactly:
 Your settings are saved automatically and restored next time you open the app.
 The active lineup is always shown in the top-right.
 
+## Use your own (or a buddy's) rankings
+
+Have a ranked list you trust more than crowd ADP? Drop it in and flip the
+**Manual rankings** switch on the draft board.
+
+- **File format** - an `.xlsx` or `.csv` with a **Player** column and, ideally,
+  an **Overall** rank column (a **Position** column like `RB7` is a nice bonus).
+  Extra columns (Team, Bye, SOS, ...) are ignored. If there's no rank column,
+  the row order is used as the ranking.
+- **Auto-detected** - any spreadsheet in the app folder with "rank" in its name
+  (e.g. `HPPR Fantasy Rankings.xlsx`) is picked up automatically. Or click
+  **Load file...** to choose one anywhere.
+- **Influence slider** - 100% drafts purely off your list's order; lower values
+  *blend* it with crowd ADP so your buddy nudges the board without fully taking
+  over. Players not in your file (and K/DEF) keep their normal ADP.
+- Recommendations show a **"your rankings: #12 (RB7)"** note so you can see when
+  your list is what's moving a player up. The status line shows how many of your
+  players were matched by name.
+
+It's a layer on top of the same engine: roster needs, positional scarcity, and
+the "don't draft a kicker in round 3" logic still apply.
+
+> Note: to use these rankings on another PC, copy the spreadsheet into the app
+> folder there too (the installer doesn't ship it, so your buddy's list isn't
+> published to GitHub).
+
 ## How to use it during your draft
 
 1. Confirm **League Settings** match your league (ask your commissioner; most
