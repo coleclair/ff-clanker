@@ -48,29 +48,48 @@ pulls from free public sources (ESPN + Sleeper, no API keys) and caches locally:
 (It's most useful in-season; during the offseason the news/injuries/odds still
 load, but trending data is quiet.)
 
-## Setup (one time)
+## Install on a new PC (one click)
 
-You need Python 3.10+ (you have 3.12). From this folder:
+You don't need Python, git, or any terminal commands. Two ways to do it:
 
-```powershell
-python -m pip install -r requirements.txt
-```
+**Option A - grab one file (nothing else needed):**
+
+1. Open [`install.bat`](https://github.com/coleclair/ff-clanker/blob/main/install.bat)
+   on GitHub and click the **Download raw file** button (the download icon,
+   top-right of the file view).
+2. Double-click the downloaded `install.bat`.
+
+That's it. It downloads the whole app, installs Python if you don't have it,
+installs the dependencies, drops a **FF Draft Assistant** shortcut (football
+icon) on your Desktop and Start Menu, and launches it. The app lands in
+`C:\Users\<you>\ff-clanker`.
+
+**Option B - download the whole repo:**
+
+1. On the GitHub page click **Code -> Download ZIP**, then extract it.
+2. Double-click **`setup.bat`** inside the extracted folder.
+
+Same result. Run `setup.bat` again any time to update to the latest version.
+
+> Why a `.bat` and not a `.ps1`? PowerShell refuses to run unsigned scripts
+> unless you pass a special argument. Batch files aren't subject to that block,
+> and they call PowerShell with `-ExecutionPolicy Bypass` for you - so you never
+> have to type anything. Nothing here is actually signed; the batch just gets
+> out of your way.
 
 ## Run it
 
-Easiest: double-click the **FF Draft Assistant** shortcut (the football icon) on
-your Desktop, or the one in this folder. It launches the app with no console
-window and auto-installs dependencies the first time.
+Double-click the **FF Draft Assistant** shortcut (the football icon) on your
+Desktop or Start Menu. It opens with no console window.
 
-Or from a terminal:
+Or from a terminal in this folder:
 
 ```powershell
 python ffdraft.py
 ```
 
-(The shortcut points at `run.bat`. If you move this folder, just re-run
-`python make_icon.py` is not needed, but recreate the shortcut by pointing it at
-the new `run.bat` location, or ask me to regenerate it.)
+If you ever move the folder, just double-click `setup.bat` again to refresh the
+shortcut.
 
 ## Set up your league rules (do this first)
 
@@ -130,6 +149,11 @@ much better a player is than the guy you'd be stuck with at his position later.
   GUI, so it can be tested on its own: `python engine.py`).
 - `season.py` - season-tab data (news/injuries/pickups/streaming); also runs
   standalone: `python season.py`.
+- `install.bat` - the only file you need on a fresh PC; downloads + sets up the
+  whole app in one double-click.
+- `setup.bat` - one-click setup/update when you already have the folder.
+- `setup.ps1` - the installer brains (found + run for you by the two `.bat`
+  files; not meant to be double-clicked directly).
 - `run.bat` - double-click launcher (no console window).
 - `football.ico` / `make_icon.py` - the app icon and the script that made it.
 - `FF Draft Assistant.lnk` - shortcut with the football icon (also on Desktop).
